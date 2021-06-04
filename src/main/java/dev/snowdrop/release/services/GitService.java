@@ -23,6 +23,13 @@ import java.util.concurrent.ExecutionException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+/**
+ * A service that allows to interact asynchronously with git repositories. A specific git repository is identified by its
+ * associated {@link GitConfig}. Typical interaction would first call {@link #initRepository(GitConfig)} to start the repository
+ * retrieval process and then call {@link #commitAndPush(String, GitConfig, RepositoryModifierCallback...)} passing it {@link
+ * RepositoryModifierCallback} implementations representing the operations that need to be performed on the retrieved repository
+ * once it's available.
+ */
 @ApplicationScoped
 public class GitService {
 
@@ -33,11 +40,17 @@ public class GitService {
         return URI.create(config.getURI(relativePath)).toURL().openStream();
     }
 
-    public void initRepository(GitConfig config) throws IOException {
+    /**
+     * Initializes the retrieval process for the specified {@link GitConfig}.
+     *
+     * @param config the configuration specifying how to retrieve the repository
+     * @throws IOException if the local directory hosting the repository couldn't be created
+     */
+    public CompletableFuture<Git> initRepository(GitConfig config) throws IOException {
         final var repository = Files.createTempDirectory(config.directoryPrefix()).toFile();
         repository.deleteOnExit();
 
-        repositories.put(config, config.cloneFrom().thenApplyAsync(branch -> {
+        final var gitCompletableFuture = config.cloneFrom().thenApplyAsync(branch -> {
             try {
                 LOG.infof("Cloned %s in %s", config.remoteURI(), repository.getPath());
                 return Git.cloneRepository()
@@ -50,40 +63,58 @@ public class GitService {
             } catch (GitAPIException e) {
                 throw new RuntimeException(e);
             }
-        }).thenApplyAsync(config::checkout));
+        }).thenApplyAsync(config::checkout);
+        repositories.put(config, gitCompletableFuture);
+        return gitCompletableFuture;
     }
 
     protected Git getConfig(GitConfig config) throws ExecutionException, InterruptedException {
         return repositories.get(config).get();
     }
 
-    protected void deleteRemoteBranch(GitConfig config, final String branchName, final String revertToBranch) throws ExecutionException, InterruptedException, GitAPIException {
+    protected void deleteRemoteBranch(GitConfig config, final String branchName, final String revertToBranch)
+        throws ExecutionException, InterruptedException, GitAPIException {
         Git git = repositories.get(config).get();
         try {
             LOG.warnf("On branch: %s", git.getRepository().getFullBranch());
         } catch (IOException e) {
             e.printStackTrace();
         }
-        git.fetch().setCredentialsProvider(config.getCredentialProvider()).setRemote("origin").setRefSpecs(String.format("+refs/heads/%s:refs/remotes/origin/%s", revertToBranch, revertToBranch)).call();
+        git.fetch().setCredentialsProvider(config.getCredentialProvider()).setRemote("origin")
+            .setRefSpecs(String.format("+refs/heads/%s:refs/remotes/origin/%s", revertToBranch, revertToBranch)).call();
         git.branchList().setListMode(ListBranchCommand.ListMode.ALL).call().forEach(x -> {
             LOG.warnf("%s", x.getName());
         });
-        git.checkout().setName(String.format("origin/%s", revertToBranch)).setCreateBranch(false).setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.NOTRACK).setStartPoint(String.format("+refs/heads/%s:refs/remotes/origin/%s", revertToBranch, revertToBranch)).call();
+        git.checkout().setName(String.format("origin/%s", revertToBranch)).setCreateBranch(false)
+            .setUpstreamMode(CreateBranchCommand.SetupUpstreamMode.NOTRACK)
+            .setStartPoint(String.format("+refs/heads/%s:refs/remotes/origin/%s", revertToBranch, revertToBranch)).call();
         git.branchDelete().setBranchNames(branchName).setForce(true).call().forEach(removedBranch -> {
             LOG.warnf("- [deleted]   %s", removedBranch);
             try {
-                git.push().setCredentialsProvider(config.getCredentialProvider()).setRefSpecs(new RefSpec().setSource(null).setDestination(removedBranch)).setRemote("origin").call();
+                git.push().setCredentialsProvider(config.getCredentialProvider())
+                    .setRefSpecs(new RefSpec().setSource(null).setDestination(removedBranch)).setRemote("origin").call();
             } catch (GitAPIException e) {
                 throw new RuntimeException(e);
             }
         });
     }
 
-    public void commitAndPush(String commitMessage, GitConfig config, FileModifier... changed) throws IOException {
-        CompletableFuture<Git> git = repositories.get(config);
-        if (git == null) {
-            throw new IllegalStateException("must call initRepository first");
-        }
+    /**
+     * Commits and then pushes any files changed by the specified {@link RepositoryModifierCallback}s in the repository
+     * identified by the specified {@link GitConfig} with the specified commit message.
+     * <p>
+     * Note that this is an asynchronous method, the {@link RepositoryModifierCallback}s are called only when the repository is
+     * actually ready to be interacted with.
+     *
+     * @param commitMessage the message to use when changes are detected and need to be pushed
+     * @param config        the {@link GitConfig} identifying which repository to interact with
+     * @param changed       optional callbacks to perform the operations that need to occur on the repository before committing
+     *                      and pushing
+     * @throws IOException when files operations fail
+     */
+    public void commitAndPush(String commitMessage, GitConfig config, RepositoryModifierCallback... changed)
+        throws IOException {
+        final CompletableFuture<Git> git = repositories.getOrDefault(config, initRepository(config));
         try {
             git.thenAcceptAsync(g -> {
                 final File repository = g.getRepository().getWorkTree();
@@ -148,9 +179,20 @@ public class GitService {
         }
     }
 
+    /**
+     * A functional interface encapsulating the modifications that need to be done on the repository once it is ready to be
+     * operated on.
+     */
     @FunctionalInterface
-    public interface FileModifier {
+    public interface RepositoryModifierCallback {
 
+        /**
+         * Modifies the specified repository and returns a {@link Stream} of changed files. Called once the {@link GitService}
+         * has finished initializing the repository.
+         *
+         * @param repo the repository that needs to be modified, once it's ready to be operated on.
+         * @return a Stream of modified files that will need to be committed and pushed
+         */
         Stream<File> modify(File repo);
     }
 
@@ -159,7 +201,8 @@ public class GitService {
         private final String user;
         private final String token;
 
-        public GitHubConfig(String org, String repo, String branch, String user, String token, Optional<String> previousBranch) {
+        public GitHubConfig(String org, String repo, String branch, String user, String token,
+            Optional<String> previousBranch) {
             super(org, repo, branch, previousBranch);
             this.user = user;
             this.token = token;
@@ -190,7 +233,8 @@ public class GitService {
         private final String user;
         private final String token;
 
-        private GitLabConfig(String org, String repo, String branch, String user, String token, Optional<String> previousBranch) {
+        private GitLabConfig(String org, String repo, String branch, String user, String token,
+            Optional<String> previousBranch) {
             super(org, repo, branch, previousBranch);
             this.user = user;
             this.token = token;
@@ -282,7 +326,8 @@ public class GitService {
          *                        desired branch needs to be created
          * @return the {@link GitConfig} needed to operate on the repository
          */
-        public static GitConfig gitlabConfig(String release, String username, String token, String gitRef, Optional<String> cloneFromGitRef, Optional<String> newBranch) {
+        public static GitConfig gitlabConfig(String release, String username, String token, String gitRef,
+            Optional<String> cloneFromGitRef, Optional<String> newBranch) {
             final var split = gitRef.split("/");
             if (split.length != 2) {
                 throw new IllegalArgumentException("Invalid git reference: " + gitRef
